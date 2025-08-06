@@ -94,10 +94,22 @@ if uploaded_file:
     pct_dict = {"N": n_pct, "P": p_pct, "K": k_pct, "Mg": mg_pct}
 
     st.write("### Fertilizer Application Recommendation:")
+    max_lbs = 0
     for nutrient, lbs in lbs_needed.items():
+        if lbs > max_lbs:
+            max_lbs = lbs
         if lbs > 0:
             st.markdown(f"<span style='color:blue; font-size:20px; font-weight:bold;'>Apply {lbs} lbs of {selected_fert} {unit} for {nutrient}.</span>", unsafe_allow_html=True)
         elif pct_dict[nutrient] > 0:
             st.write(f"No {nutrient} needed. {selected_fert} provides {nutrient}.")
+
+    if max_lbs > 0:
+        st.markdown(f"<span style='color:orange; font-size:22px; font-weight:bold;'>Summary: Apply {max_lbs} lbs of {selected_fert} {unit} to satisfy this soil report.</span>", unsafe_allow_html=True)
+
+    if st.button("Help me find the fertilizer"):
+        search_term = selected_fert.split("(")[0].strip() + " fertilizer"
+        search_term = search_term.replace(" ", "+")
+        search_url = f"https://www.google.com/search?tbm=shop&q={search_term}"
+        st.markdown(f"<a href='{search_url}' target='_blank'><button style='margin:5px;padding:10px;background-color:#4CAF50;color:white;border:none;border-radius:4px;'>Shop Online</button></a>", unsafe_allow_html=True)
 
     st.success("Calculation Complete.")
