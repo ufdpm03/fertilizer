@@ -2,89 +2,102 @@ import streamlit as st
 import fitz  # PyMuPDF
 import re
 
-st.set_page_config(page_title="Stacy's Fertilizer Calculator", page_icon="🌱", layout="centered")
-st.title("Stacy's Fertilizer Calculator with Fertilizer Dropdowns")
+st.title("Soil Test Fertilizer Calculator")
 
-st.markdown("""
-<div style='color: #fa4616; font-weight: bold; font-size: 20px;'>Welcome!</div>
-<div style='font-size:16px;'>Upload a soil test PDF. Select fertilizer products to see application needs.</div>
-<br>
-""", unsafe_allow_html=True)
+uploaded_file = st.file_uploader("Upload Soil Test PDF", type="pdf")
 
-pdf_file = st.file_uploader("Upload your soil test report (PDF)", type=["pdf"])
-
-if pdf_file:
-    st.success(f"File uploaded: {pdf_file.name}")
-    try:
-        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-        all_text = ""
+if uploaded_file:
+    pdf_text = ""
+    with fitz.open(stream=uploaded_file.read(), filetype="pdf") as doc:
         for page in doc:
-            all_text += page.get_text() + "\n"
-        all_text = all_text.replace("\n", " ")
-        st.text_area("Extracted PDF Text", all_text, height=300)
+            pdf_text += page.get_text()
 
-        st.markdown("<div style='color:#fa4616;'>Parsing nutrient values...</div>", unsafe_allow_html=True)
+    # Extract crop name
+    crop_match = re.search(r"Crop:\s*(.+?)\n", pdf_text)
+    crop_name = crop_match.group(1).strip() if crop_match else "Unknown"
 
-        unit_match = re.search(r"per (\d+\s*sq\.*\s*ft)", all_text.lower())
-        if unit_match:
-            raw_unit = unit_match.group(1).replace(" ", "").replace("sq.ft", "sq ft").strip()
-            unit = raw_unit
-        else:
-            unit = "acre"
+    # Determine unit based on crop type
+    crop_lower = crop_name.lower()
+    if any(term in crop_lower for term in ["lawn", "turf"]):
+        unit = "per 1,000 sq ft"
+    elif "vegetable" in crop_lower:
+        unit = "per 100 sq ft"
+    else:
+        unit = "per acre"
 
-        n_match_home = re.search(r"Nitrogen\(N\):\s*(\d+\.?\d*) lbs per .*?", all_text)
-        n_match_farm = re.search(r"Apply (\d+\.?\d*) lbs of Nitrogen per Acre", all_text)
-        n = float(n_match_home.group(1)) if n_match_home else (float(n_match_farm.group(1)) if n_match_farm else 0)
+    # Improved nutrient extraction with multiple patterns
+    def extract_nutrient(nutrient, text):
+        patterns = [
+            fr"{nutrient}\(.*?\):\s*([0-9.]+)\s*lbs",  # pattern 1
+            fr"{nutrient}.*?:\s*([0-9.]+)\s*lbs",       # pattern 2
+            fr"{nutrient}.*?\s+([0-9.]+)\s+lbs",        # pattern 3
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+        return 0.0
 
-        p_match = re.search(r"Phosphorus\(P2O5\):\s*(\d+\.?\d*) lbs per .*?", all_text)
-        k_match = re.search(r"Potassium\(K2O\):\s*(\d+\.?\d*) lbs per .*?", all_text)
-        mg_match = re.search(r"Magnesium\(Mg\):\s*(\d+\.?\d*) lbs per .*?", all_text)
-        lime_match = re.search(r"Lime:\s*(\d+\.?\d*) lbs per .*?", all_text)
+    n_rec = extract_nutrient("Nitrogen", pdf_text)
+    p_rec = extract_nutrient("Phosphorus", pdf_text)
+    k_rec = extract_nutrient("Potassium", pdf_text)
+    mg_rec = extract_nutrient("Magnesium", pdf_text)
 
-        p = float(p_match.group(1)) if p_match else 0
-        k = float(k_match.group(1)) if k_match else 0
-        mg = float(mg_match.group(1)) if mg_match else 0
-        lime = float(lime_match.group(1)) if lime_match else 0
+    # Auto override for hay or silage nitrogen recommendation
+    nitrogen_override_note = None
+    if any(term in crop_lower for term in ["hay", "silage", "perennial grass"]):
+        if n_rec == 0.0:
+            n_rec = 80.0
+            nitrogen_override_note = "Standard N recommendation for hay; not based on soil test."
 
-        st.markdown(f"<div style='color:#0021a5;'>Lime: {lime} lbs per {unit}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='color:#0021a5;'>Nitrogen: {n} lbs per {unit}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='color:#0021a5;'>Phosphorus: {p} lbs per {unit}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='color:#0021a5;'>Potassium: {k} lbs per {unit}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='color:#0021a5;'>Magnesium: {mg} lbs per {unit}</div>", unsafe_allow_html=True)
+    st.subheader("Crop: " + crop_name)
 
-        st.markdown("<hr><div style='color:#fa4616;'>Select Fertilizer Products:</div>", unsafe_allow_html=True)
-        fertilizer_options = {
-    "10-10-10": (10, 10, 10, 0),
-    "16-4-8": (16, 4, 8, 0),
-    "Ammonium Nitrate (34-0-0)": (34, 0, 0, 0),
-    "Ammonium Sulfate (21-0-0)": (21, 0, 0, 0),
-    "Triple Superphosphate (0-46-0)": (0, 46, 0, 0),
-    "Muriate of Potash (0-0-60)": (0, 0, 60, 0),
-    "Epsom Salt (10% Mg)": (0, 0, 0, 10)
-}
-        selected_ferts = st.multiselect("Select fertilizers available", list(fertilizer_options.keys()), default=["10-10-10"])
+    st.write(f"**Nitrogen (N):** {n_rec} lbs {unit}")
+    if nitrogen_override_note:
+        st.caption(nitrogen_override_note)
 
-        st.markdown("<div style='color:#fa4616;'>Fertilizer Recommendations:</div>", unsafe_allow_html=True)
-        for fert in selected_ferts:
-            comp = fertilizer_options[fert]
-            if fert == "Epsom Salt (10% Mg)" and mg > 0:
-                epsom_needed = round(mg / 10 * 100, 2)
-                st.markdown(f"<div style='color:#0021a5; font-weight:bold;'>Epsom Salt: {epsom_needed} lbs per {unit}</div>", unsafe_allow_html=True)
-            elif fert != "Epsom Salt (10% Mg)":
-                n_pct, p_pct, k_pct = comp[0], comp[1], comp[2]
-                needed = max(
-                    n / (n_pct / 100) if n_pct > 0 else 0,
-                    p / (p_pct / 100) if p_pct > 0 else 0,
-                    k / (k_pct / 100) if k_pct > 0 else 0
-                )
-                needed = round(needed, 2)
-                if needed > 0:
-                    st.markdown(f"<div style='color:#0021a5; font-weight:bold;'>{fert}: {needed} lbs per {unit}</div>", unsafe_allow_html=True)
+    st.write(f"**Phosphorus (P₂O₅):** {p_rec} lbs {unit}")
+    st.write(f"**Potassium (K₂O):** {k_rec} lbs {unit}")
+    st.write(f"**Magnesium (Mg):** {mg_rec} lbs {unit}")
 
-        if lime > 0:
-            st.markdown(f"<div style='color:#0021a5;'>Apply {lime} lbs per {unit} of lime</div>", unsafe_allow_html=True)
+    st.markdown("---")
 
-    except Exception as e:
-        st.error(f"Error during PDF processing: {e}")
-else:
-    st.info("Please upload a PDF to continue.")
+    st.subheader("Fertilizer Product Suggestions")
+    fertilizers = {
+        "16-4-8": (16, 4, 8, 0),
+        "8-8-8": (8, 8, 8, 0),
+        "10-10-10": (10, 10, 10, 0),
+        "Ammonium Nitrate (34-0-0)": (34, 0, 0, 0),
+        "Ammonium Sulfate (21-0-0)": (21, 0, 0, 0),
+        "Triple Superphosphate (0-45-0)": (0, 45, 0, 0),
+        "Muriate of Potash (0-0-60)": (0, 0, 60, 0),
+        "K-Mag (0-0-22-11Mg)": (0, 0, 22, 11),
+        "Epsom Salt (0-0-0-10Mg)": (0, 0, 0, 10),
+    }
+
+    selected_fert = st.selectbox("Select a Fertilizer Product:", list(fertilizers.keys()))
+
+    n_pct, p_pct, k_pct, mg_pct = fertilizers[selected_fert]
+
+    def calc_lbs_needed(target, pct):
+        if pct == 0 or target == 0:
+            return 0.0
+        return round(target / (pct / 100), 2)
+
+    lbs_needed = {
+        "N": calc_lbs_needed(n_rec, n_pct),
+        "P": calc_lbs_needed(p_rec, p_pct),
+        "K": calc_lbs_needed(k_rec, k_pct),
+        "Mg": calc_lbs_needed(mg_rec, mg_pct),
+    }
+
+    pct_dict = {"N": n_pct, "P": p_pct, "K": k_pct, "Mg": mg_pct}
+
+    st.write("### Fertilizer Application Recommendation:")
+    for nutrient, lbs in lbs_needed.items():
+        if lbs > 0:
+            st.markdown(f"<span style='color:blue; font-size:20px; font-weight:bold;'>Apply {lbs} lbs of {selected_fert} {unit} for {nutrient}.</span>", unsafe_allow_html=True)
+        elif pct_dict[nutrient] > 0:
+            st.write(f"No {nutrient} needed. {selected_fert} provides {nutrient}.")
+
+    st.success("Calculation Complete.")
