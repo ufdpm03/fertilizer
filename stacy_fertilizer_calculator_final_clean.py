@@ -1,67 +1,197 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import re
+import urllib.parse
 
 st.title("Soil Test Fertilizer Calculator")
 
 uploaded_file = st.file_uploader("Upload Soil Test PDF", type="pdf")
 
+# ---------------- helpers ----------------
+def clean_num(x):
+    try:
+        return float(x)
+    except:
+        return 0.0
+
+def fmt(v):
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+def extract_num_after_label(block: str, label_regex: str) -> float:
+    pats = [
+        rf"{label_regex}[^:\n]*:\s*([0-9.]+)\s*l(?:b|bs)\b",
+        rf"{label_regex}.*?([0-9.]+)\s*l(?:b|bs)\b",
+    ]
+    for p in pats:
+        m = re.search(p, block, flags=re.IGNORECASE)
+        if m:
+            return clean_num(m.group(1))
+    return 0.0
+
+# ---------- Unit detection (explicit text first, crop fallback) ----------
+def detect_unit(text: str, crop_name: str):
+    """
+    Returns (unit_string, source_string)
+    Explicit text beats crop heuristic.
+    """
+    t = (text or "").lower()
+
+    def has(pat: str) -> bool:
+        return re.search(pat, t, flags=re.IGNORECASE) is not None
+
+    # Accept "sq ft", "sq. ft.", "sq.ft", "sqft"
+    if has(r"per\s+1[, ]?000\s*(?:sq\.?\s*ft\.?|sqft)"):
+        return "per 1,000 sq ft", "detected from report text"
+    if has(r"per\s+100\s*(?:sq\.?\s*ft\.?|sqft)"):
+        return "per 100 sq ft", "detected from report text"
+    if has(r"per\s+acre"):
+        return "per acre", "detected from report text"
+
+    cl = (crop_name or "").lower()
+    if any(w in cl for w in ["vegetable garden", "vegetable", "garden"]):
+        return "per 100 sq ft", "based on crop type"
+    if any(w in cl for w in ["lawn", "turf", "st. augustine", "zoysia"]):
+        return "per 1,000 sq ft", "based on crop type"
+    if any(w in cl for w in ["bahia", "bahiagrass", "pasture", "hay", "silage", "perennial grass", "bermudagrass", "forage", "producer"]):
+        return "per acre", "based on crop type"
+
+    return "per acre", "default"
+
+# ---------- Generic extractors (non-Bahia) ----------
+def extract_generic_nutrient(text: str, label: str) -> float:
+    patterns = [
+        rf"{label}\s*\([^)]*\)\s*:\s*([0-9.]+)\s*l(?:b|bs)\b",
+        rf"{label}[^:\n]*:\s*([0-9.]+)\s*l(?:b|bs)\b",
+        rf"{label}.*?\s([0-9.]+)\s*l(?:b|bs)\b",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except:
+                pass
+    return 0.0
+
+# ---------- Bahia-specific bits (parsing only; UI stays the same) ----------
+def extract_bahia_n(block: str) -> float:
+    pats = [
+        r"Nitrogen\s*\(\s*N\s*\)\s*:\s*Apply\s*([0-9.]+)\s*l(?:b|bs)\s+of\s+Nitrogen\s+per\s+Acre",
+        r"Nitrogen\s*\(\s*N\s*\)\s*:\s*([0-9.]+)\s*l(?:b|bs)\s+per\s+acre",
+        r"(?:Apply\s*)?([0-9.]+)\s*l(?:b|bs)\s*(?:of\s*)?(?:Nitrogen|N)\b.*per\s+acre",
+    ]
+    for p in pats:
+        m = re.search(p, block, flags=re.IGNORECASE)
+        if m:
+            return clean_num(m.group(1))
+    return extract_num_after_label(block, r"Nitrogen\s*\(\s*N\s*\)")
+
+def extract_p_bahia(block: str) -> float:
+    if re.search(r"no\s+P\s+recommendation", block, re.IGNORECASE):
+        return 0.0
+    pats = [
+        r"Phosphorus\s*\(\s*P(?:2O5|₂O₅)\s*\)\s*:\s*([0-9.]+)\s*l(?:b|bs)\b",
+        r"(?:P2O5|P₂O₅)[^:\n]*:\s*([0-9.]+)\s*l(?:b|bs)\b",
+    ]
+    for p in pats:
+        m = re.search(p, block, flags=re.IGNORECASE)
+        if m:
+            return clean_num(m.group(1))
+    return 0.0
+
+def extract_mg(block: str) -> float:
+    return extract_num_after_label(block, r"Magnesium\s*\(\s*Mg\s*\)")
+
+# ---------- Robust sample splitter (avoids false multiples) ----------
+def _find_crop(text: str) -> str:
+    m = re.search(r"Crop:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    return m.group(1).strip() if m else "Unknown"
+
+def split_samples(pdf_text: str):
+    """
+    Split by 'Client Identification ... Lab Number ...' or
+    'Sample Number ... Lab Number ...'. Fallback = whole doc.
+    """
+    pat = re.compile(
+        r"(Client Identification:.*?Lab Number:\s*\S+)|(Sample Number:.*?Lab Number:\s*\S+)",
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    matches = list(pat.finditer(pdf_text))
+    if not matches:
+        return [{"label": "Sample", "crop": _find_crop(pdf_text), "text": pdf_text}]
+
+    blocks = []
+    for i, m in enumerate(matches):
+        s = m.start()
+        e = matches[i+1].start() if i+1 < len(matches) else len(pdf_text)
+        block = pdf_text[s:e]
+        label = None
+        m1 = re.search(r"Client Identification:\s*(.+?)\s+Set Number:\s*([A-Z0-9-]+)\s+Lab Number:\s*([A-Z0-9-]+)", block, re.IGNORECASE)
+        if m1:
+            label = f"{m1.group(1).strip()} | Set {m1.group(2)} | Lab {m1.group(3)}"
+        else:
+            m2 = re.search(r"Sample Number:\s*([0-9-]+).*?Lab Number:\s*([A-Z0-9-]+)", block, re.IGNORECASE | re.DOTALL)
+            if m2:
+                label = f"Sample {m2.group(1)} | Lab {m2.group(2)}"
+        blocks.append({"label": label or f"Sample {i+1}", "crop": _find_crop(block), "text": block})
+    return blocks
+
+# ---------------- main ----------------
 if uploaded_file:
     pdf_text = ""
     with fitz.open(stream=uploaded_file.read(), filetype="pdf") as doc:
         for page in doc:
             pdf_text += page.get_text()
 
-    # Extract crop name
-    crop_match = re.search(r"Crop:\s*(.+?)\n", pdf_text)
-    crop_name = crop_match.group(1).strip() if crop_match else "Unknown"
+    samples = split_samples(pdf_text)
 
-    # Determine unit based on crop type
-    crop_lower = crop_name.lower()
-    if any(term in crop_lower for term in ["lawn", "turf"]):
-        unit = "per 1,000 sq ft"
-    elif "vegetable" in crop_lower:
-        unit = "per 100 sq ft"
+    # Dropdown only if >1
+    if len(samples) > 1:
+        choice = st.selectbox("Select sample in this PDF:", [s["label"] for s in samples])
+        sample = next(s for s in samples if s["label"] == choice)
     else:
-        unit = "per acre"
+        sample = samples[0]
 
-    # Improved nutrient extraction with multiple patterns
-    def extract_nutrient(nutrient, text):
-        patterns = [
-            fr"{nutrient}\(.*?\):\s*([0-9.]+)\s*lbs",  # pattern 1
-            fr"{nutrient}.*?:\s*([0-9.]+)\s*lbs",       # pattern 2
-            fr"{nutrient}.*?\s+([0-9.]+)\s+lbs",        # pattern 3
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return float(match.group(1))
-        return 0.0
+    block = sample["text"]
+    crop_name = sample["crop"]
+    unit, unit_src = detect_unit(block, crop_name)
 
-    n_rec = extract_nutrient("Nitrogen", pdf_text)
-    p_rec = extract_nutrient("Phosphorus", pdf_text)
-    k_rec = extract_nutrient("Potassium", pdf_text)
-    mg_rec = extract_nutrient("Magnesium", pdf_text)
+    # Parse nutrients (Bahia gets special N; everything else generic)
+    bahia = "bahia" in crop_name.lower()
+    if bahia:
+        n_rec = extract_bahia_n(block) or 80.0  # safety net
+        p_rec = extract_p_bahia(block)
+        k_rec = extract_generic_nutrient(block, "Potassium")  # numeric if present
+        mg_rec = extract_mg(block)
+    else:
+        n_rec  = extract_generic_nutrient(block, "Nitrogen")
+        p_rec  = extract_generic_nutrient(block, "Phosphorus")
+        k_rec  = extract_generic_nutrient(block, "Potassium")
+        mg_rec = extract_generic_nutrient(block, "Magnesium")
 
-    # Auto override for hay or silage nitrogen recommendation
+    # Old override for hay/silage/perennial grass
     nitrogen_override_note = None
+    crop_lower = crop_name.lower()
     if any(term in crop_lower for term in ["hay", "silage", "perennial grass"]):
         if n_rec == 0.0:
             n_rec = 80.0
             nitrogen_override_note = "Standard N recommendation for hay; not based on soil test."
 
-    st.subheader("Crop: " + crop_name)
+    # ----------- Display (old style) -----------
+    st.subheader(f"Crop: {crop_name}")
+    st.caption(f"Units shown {unit} — {unit_src}")
 
-    st.write(f"**Nitrogen (N):** {n_rec} lbs {unit}")
-    if nitrogen_override_note:
-        st.caption(nitrogen_override_note)
-
-    st.write(f"**Phosphorus (P₂O₅):** {p_rec} lbs {unit}")
-    st.write(f"**Potassium (K₂O):** {k_rec} lbs {unit}")
-    st.write(f"**Magnesium (Mg):** {mg_rec} lbs {unit}")
+    if n_rec > 0: st.write(f"**Nitrogen (N):** {fmt(n_rec)} lbs {unit}")
+    if nitrogen_override_note: st.caption(nitrogen_override_note)
+    if p_rec > 0: st.write(f"**Phosphorus (P₂O₅):** {fmt(p_rec)} lbs {unit}")
+    if k_rec > 0: st.write(f"**Potassium (K₂O):** {fmt(k_rec)} lbs {unit}")
+    if mg_rec > 0: st.write(f"**Magnesium (Mg):** {fmt(mg_rec)} lbs {unit}")
+    if all(v == 0 for v in [n_rec, p_rec, k_rec, mg_rec]):
+        st.info("No nutrient additions recommended in the parsed report.")
 
     st.markdown("---")
 
+    # ----------- Fertilizer Product Suggestions (old style) -----------
     st.subheader("Fertilizer Product Suggestions")
     fertilizers = {
         "16-4-8": (16, 4, 8, 0),
@@ -76,13 +206,12 @@ if uploaded_file:
     }
 
     selected_fert = st.selectbox("Select a Fertilizer Product:", list(fertilizers.keys()))
-
     n_pct, p_pct, k_pct, mg_pct = fertilizers[selected_fert]
 
     def calc_lbs_needed(target, pct):
         if pct == 0 or target == 0:
             return 0.0
-        return round(target / (pct / 100), 2)
+        return round(target / (pct / 100.0), 2)
 
     lbs_needed = {
         "N": calc_lbs_needed(n_rec, n_pct),
@@ -91,25 +220,42 @@ if uploaded_file:
         "Mg": calc_lbs_needed(mg_rec, mg_pct),
     }
 
-    pct_dict = {"N": n_pct, "P": p_pct, "K": k_pct, "Mg": mg_pct}
-
     st.write("### Fertilizer Application Recommendation:")
-    max_lbs = 0
+    any_line = False
     for nutrient, lbs in lbs_needed.items():
-        if lbs > max_lbs:
-            max_lbs = lbs
         if lbs > 0:
-            st.markdown(f"<span style='color:blue; font-size:20px; font-weight:bold;'>Apply {lbs} lbs of {selected_fert} {unit} for {nutrient}.</span>", unsafe_allow_html=True)
-        elif pct_dict[nutrient] > 0:
+            any_line = True
+            st.markdown(
+                f"<span style='color:blue; font-size:20px; font-weight:bold;'>Apply {lbs} lbs of {selected_fert} {unit} for {nutrient}.</span>",
+                unsafe_allow_html=True
+            )
+        elif fertilizers[selected_fert][{'N':0,'P':1,'K':2,'Mg':3}[nutrient]] > 0:
+            # old inline note if product contains a nutrient that isn't needed
             st.write(f"No {nutrient} needed. {selected_fert} provides {nutrient}.")
 
+    # Old-style summary: single rate that satisfies the largest requirement
+    max_lbs = max(lbs_needed.values()) if any_line else 0.0
     if max_lbs > 0:
-        st.markdown(f"<span style='color:orange; font-size:22px; font-weight:bold;'>Summary: Apply {max_lbs} lbs of {selected_fert} {unit} to satisfy this soil report.</span>", unsafe_allow_html=True)
-
-    if st.button("Help me find the fertilizer"):
-        search_term = selected_fert.split("(")[0].strip() + " fertilizer"
-        search_term = search_term.replace(" ", "+")
-        search_url = f"https://www.google.com/search?tbm=shop&q={search_term}"
-        st.markdown(f"<a href='{search_url}' target='_blank'><button style='margin:5px;padding:10px;background-color:#4CAF50;color:white;border:none;border-radius:4px;'>Shop Online</button></a>", unsafe_allow_html=True)
+        st.markdown(
+            f"<span style='color:orange; font-size:20px; font-weight:bold;'>Summary: "
+            f"Apply {max_lbs} lbs of {selected_fert} {unit} to satisfy this soil report.</span>",
+            unsafe_allow_html=True
+        )
 
     st.success("Calculation Complete.")
+
+    # ---------- Help me find this fertilizer (button that actually opens) ----------
+    if selected_fert:
+        query = urllib.parse.quote(
+            selected_fert + " fertilizer site:amazon.com OR site:tractorsupply.com OR site:lowes.com OR site:homedepot.com"
+        )
+        url = f"https://www.google.com/search?q={query}"
+
+        # Streamlit >= 1.32: link_button exists
+        if hasattr(st, "link_button"):
+            st.link_button("🔍 Help me find this fertilizer", url)
+        else:
+            # Fallback for older Streamlit
+            from streamlit.components.v1 import html
+            if st.button("🔍 Help me find this fertilizer"):
+                html(f"<script>window.open('{url}', '_blank');</script>", height=0)
