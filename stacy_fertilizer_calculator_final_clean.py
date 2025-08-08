@@ -57,6 +57,60 @@ def detect_unit(text: str, crop_name: str):
 
     return "per acre", "default"
 
+# ---------- Lime detection ----------
+def _normalize_unit_token(u: str) -> str | None:
+    if not u: 
+        return None
+    u = u.lower()
+    if "acre" in u or u.strip() in ("ac",):
+        return "per acre"
+    if "1,000" in u or "1000" in u:
+        return "per 1,000 sq ft"
+    if "100" in u:
+        return "per 100 sq ft"
+    if "sq" in u and "ft" in u:  # generic sq ft without quantity -> leave None
+        return None
+    return None
+
+def extract_lime(block: str, default_unit: str):
+    """
+    Returns tuple: (lime_value_float, unit_string, found_anything_bool, explicit_bool, no_lime_bool)
+    - explicit_bool means unit was captured from the text itself.
+    - no_lime_bool means text explicitly said no lime needed.
+    """
+    t = block
+
+    # Explicit "no lime" phrases
+    if re.search(r"\b(no\s+lime\s+(?:needed|required|recommended)|lime\s+not\s+required)\b", t, re.IGNORECASE):
+        return 0.0, default_unit, True, False, True
+
+    # Patterns with captured unit
+    pats_with_unit = [
+        r"Lime(?:\s*(?:Requirement|Req\.?)\s*)?[^:\n]*:\s*([0-9.]+)\s*l(?:b|bs)\s*(?:of\s+lime\s*)?(?:per|/)\s*([A-Za-z0-9 ,._]+)",
+        r"Apply\s*([0-9.]+)\s*l(?:b|bs)\s*(?:of\s+)?(?:agricultural\s+)?lime\s*(?:per|/)\s*([A-Za-z0-9 ,._]+)",
+    ]
+    for p in pats_with_unit:
+        m = re.search(p, t, re.IGNORECASE)
+        if m:
+            val = clean_num(m.group(1))
+            raw_u = (m.group(2) or "").strip()
+            unit = _normalize_unit_token(raw_u) or default_unit
+            return val, unit, True, True, False
+
+    # Numeric lime with no explicit unit -> use default unit
+    pats_no_unit = [
+        r"Lime(?:\s*(?:Requirement|Req\.?)\s*)?[^:\n]*:\s*([0-9.]+)\s*l(?:b|bs)\b",
+        r"Apply\s*([0-9.]+)\s*l(?:b|bs)\s*(?:of\s+)?(?:agricultural\s+)?lime\b",
+    ]
+    for p in pats_no_unit:
+        m = re.search(p, t, re.IGNORECASE)
+        if m:
+            val = clean_num(m.group(1))
+            return val, default_unit, True, False, False
+
+    # Nothing found
+    return 0.0, default_unit, False, False, False
+
 # ---------- Generic extractors (non-Bahia) ----------
 def extract_generic_nutrient(text: str, label: str) -> float:
     patterns = [
@@ -188,6 +242,20 @@ if uploaded_file:
     if mg_rec > 0: st.write(f"**Magnesium (Mg):** {fmt(mg_rec)} lbs {unit}")
     if all(v == 0 for v in [n_rec, p_rec, k_rec, mg_rec]):
         st.info("No nutrient additions recommended in the parsed report.")
+
+    # ----------- Lime section -----------
+    lime_val, lime_unit_used, lime_found, lime_explicit, lime_none = extract_lime(block, unit)
+    st.markdown("---")
+    st.subheader("Lime Recommendation")
+    if lime_none or (lime_found and lime_val == 0):
+        st.markdown("<span style='color:#1E88E5; font-weight:600;'>No lime needed.</span>", unsafe_allow_html=True)
+    elif lime_found and lime_val > 0:
+        st.markdown(
+            f"<span style='color:#2E7D32; font-weight:700;'>Lime needed: {fmt(lime_val)} lbs {lime_unit_used}</span>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.caption("No lime info found in this sample.")
 
     st.markdown("---")
 
